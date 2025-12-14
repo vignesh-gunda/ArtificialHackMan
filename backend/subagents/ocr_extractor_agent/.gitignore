@@ -1,0 +1,19 @@
+# Environment & secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+
+# Data
+inputs/Audit_Work_PDFs/*.pdf
+outputs/extracted_findings/*.json
+
+# Logs
+*.log
