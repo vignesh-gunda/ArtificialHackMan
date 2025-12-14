@@ -1,91 +1,90 @@
 import os
-import base64
 import asyncio
 from typing import Dict, Any
 from pathlib import Path
 import fitz  # PyMuPDF
-from openai import AsyncOpenAI
-import httpx
+import pytesseract
+from PIL import Image
+import io
+import re
 
 class DeepSeekOCRService:
     def __init__(self, api_token: str = None):
-        # Prioritize Replicate if token is explicitly set
-        replicate_token = os.getenv("REPLICATE_API_TOKEN")
-        friendli_token = os.getenv("FRIENDLI_TOKEN")
+        """
+        Open-source OCR service using Tesseract OCR
+        No API tokens required - fully local processing
+        """
+        self.provider = "tesseract"
         
-        self.api_token = api_token or replicate_token or friendli_token
+        # Configure Tesseract (you may need to adjust the path based on your system)
+        # On macOS with Homebrew: brew install tesseract
+        # On Ubuntu: sudo apt-get install tesseract-ocr
+        try:
+            # Test if tesseract is available
+            pytesseract.get_tesseract_version()
+            print(f"Using Tesseract OCR version: {pytesseract.get_tesseract_version()}")
+        except Exception as e:
+            print(f"Warning: Tesseract not found. Please install it: {e}")
+            print("macOS: brew install tesseract")
+            print("Ubuntu: sudo apt-get install tesseract-ocr")
         
-        if not self.api_token:
-            raise ValueError("FRIENDLI_TOKEN or REPLICATE_API_TOKEN not provided")
-        
-        # Determine provider - prioritize Replicate if token exists
-        if replicate_token:
-            self.provider = "replicate"
-            self.httpx_client = httpx.AsyncClient(
-                headers={"Authorization": f"Token {replicate_token}"},
-                timeout=60.0
-            )
-            # Parse model version
-            full_model_string = os.getenv("REPLICATE_MODEL", "lucataco/deepseek-ocr:cb3b474fbfc56b1664c8c7841550bccecbe7b74c30e45ce938ffca1180b4dff5")
-            if ":" in full_model_string:
-                self.model_version = full_model_string.split(":")[-1]
-            else:
-                self.model_version = full_model_string
-        else:
-            self.provider = "friendli"
-        
-        if self.provider == "friendli":
-             base_url = "https://api.friendli.ai/serverless/v1"
-             default_headers = {}
-             team_id = os.getenv("FRIENDLI_TEAM_ID")
-             if team_id:
-                 default_headers["X-Friendli-Team"] = team_id
+        # Configure OCR settings for better accuracy
+        self.ocr_config = '--oem 3 --psm 6'
 
-             self.client = AsyncOpenAI(
-                 api_key=self.api_token,
-                 base_url=base_url,
-                 default_headers=default_headers
-             )
-             self.model_id = os.getenv("FRIENDLI_MODEL", "zai-org/GLM-4.6")
+    def _clean_text(self, text: str) -> str:
+        """Clean and format OCR text output"""
+        if not text:
+            return ""
         
-    async def _run_replicate(self, img_base64: str) -> str:
-        url = "https://api.replicate.com/v1/predictions"
-        payload = {
-            "version": self.model_version,
-            "input": {
-                "image": f"data:image/png;base64,{img_base64}"
-            }
-        }
+        # Remove excessive whitespace using simple string operations
+        lines = text.split('\n')
+        cleaned_lines = []
         
-        resp = await self.httpx_client.post(url, json=payload)
-        resp.raise_for_status()
-        prediction = resp.json()
-        prediction_id = prediction["id"]
+        for line in lines:
+            # Remove extra spaces
+            cleaned_line = ' '.join(line.split())
+            if cleaned_line:
+                cleaned_lines.append(cleaned_line)
         
-        # Poll for completion
-        while prediction["status"] not in ["succeeded", "failed", "canceled"]:
-            await asyncio.sleep(1)
-            resp = await self.httpx_client.get(f"{url}/{prediction_id}")
-            resp.raise_for_status()
-            prediction = resp.json()
+        # Join lines and remove excessive line breaks
+        text = '\n'.join(cleaned_lines)
+        
+        # Fix common OCR errors
+        text = text.replace('|', 'I')  # Common OCR mistake
+        
+        return text.strip()
+
+    def _format_as_markdown(self, text: str, page_num: int) -> str:
+        """Convert plain text to basic markdown format"""
+        if not text:
+            return ""
+        
+        lines = text.split('\n')
+        markdown_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                markdown_lines.append('')
+                continue
             
-        if prediction["status"] != "succeeded":
-            raise RuntimeError(f"Replicate prediction failed: {prediction.get('error')}")
-            
-        output = prediction["output"]
-        if isinstance(output, list):
-            return "".join([str(x) for x in output])
-        elif isinstance(output, dict):
-            return output.get("markdown", "") or output.get("text", "")
-        if output is None:
-             return ""
-        return str(output)
+            # Detect potential headers (lines that are all caps)
+            if len(line) > 3 and line.isupper():
+                markdown_lines.append(f"## {line}")
+            # Detect bullet points
+            elif line.startswith(('•', '-', '*', '◦')):
+                markdown_lines.append(f"- {line[1:].strip()}")
+            # Detect numbered lists (simple approach)
+            elif line and line[0].isdigit() and ('.' in line[:5] or ')' in line[:5]):
+                markdown_lines.append(f"1. {line}")
+            else:
+                markdown_lines.append(line)
+        
+        return '\n'.join(markdown_lines)
 
     async def process_pdf(self, pdf_path: str) -> Dict[str, Any]:
-        """Process PDF through Friendli or Replicate OCR (page by page) with retry logic"""
-        max_retries = 3
-        retry_delay = 2
-        
+        """Process PDF through Tesseract OCR (page by page)"""
+        doc = None
         try:
             # Validate file
             path = Path(pdf_path)
@@ -94,62 +93,59 @@ class DeepSeekOCRService:
             
             # Check for empty file
             if path.stat().st_size == 0:
-                 raise ValueError(f"PDF file is empty: {pdf_path}")
+                raise ValueError(f"PDF file is empty: {pdf_path}")
 
             doc = fitz.open(pdf_path)
+            page_count = len(doc)
             full_markdown = ""
             
-            for page_num in range(len(doc)):
-                page = doc.load_page(page_num)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x zoom for better OCR
-                img_data = pix.tobytes("png")
-                img_base64 = base64.b64encode(img_data).decode()
-                
-                # Retry logic for each page
-                page_success = False
-                for attempt in range(max_retries):
-                    try:
-                        page_text = ""
-                        if self.provider == "friendli":
-                            response = await self.client.chat.completions.create(
-                                model=self.model_id,
-                                messages=[{
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "text", "text": "Transcribe the text in this image to Markdown. Preserve tables and formatting exactly."},
-                                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_base64}"}}
-                                    ]
-                                }],
-                                stream=False
-                            )
-                            page_text = response.choices[0].message.content
-                        else:
-                            # Replicate logic using httpx
-                            page_text = await self._run_replicate(img_base64)
-
-                        full_markdown += f"\n--- Page {page_num+1} ---\n{page_text}"
-                        page_success = True
-                        if self.provider == "replicate":
-                             await asyncio.sleep(2) # moderate delay
-                        break
-                    except Exception as e:
-                        print(f"    Page {page_num+1} attempt {attempt+1} failed ({self.provider}): {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(retry_delay * (attempt + 1))
-                            
-                if not page_success:
-                    return {
-                        "markdown": full_markdown,
-                        "error": f"Failed to process page {page_num+1} using {self.provider}",
-                        "status": "failed",
-                        "attempt": max_retries
-                    }
+            print(f"Processing {page_count} pages with Tesseract OCR...")
+            
+            for page_num in range(page_count):
+                try:
+                    page = doc.load_page(page_num)
+                    
+                    # Convert page to high-resolution image for better OCR
+                    mat = fitz.Matrix(3.0, 3.0)  # 3x zoom for better OCR accuracy
+                    pix = page.get_pixmap(matrix=mat)
+                    img_data = pix.tobytes("png")
+                    
+                    # Convert to PIL Image
+                    image = Image.open(io.BytesIO(img_data))
+                    
+                    # Enhance image for better OCR
+                    # Convert to grayscale for better text recognition
+                    if image.mode != 'L':
+                        image = image.convert('L')
+                    
+                    # Run OCR with custom configuration
+                    page_text = pytesseract.image_to_string(
+                        image, 
+                        config=self.ocr_config,
+                        lang='eng'  # You can add more languages: 'eng+fra+deu'
+                    )
+                    
+                    # Clean and format the text
+                    cleaned_text = self._clean_text(page_text)
+                    markdown_text = self._format_as_markdown(cleaned_text, page_num + 1)
+                    
+                    if markdown_text.strip():
+                        full_markdown += f"\n\n--- Page {page_num + 1} ---\n\n{markdown_text}"
+                    else:
+                        full_markdown += f"\n\n--- Page {page_num + 1} ---\n\n*[No text detected on this page]*"
+                    
+                    print(f"Processed page {page_num + 1}/{page_count}")
+                    
+                except Exception as e:
+                    print(f"Error processing page {page_num + 1}: {e}")
+                    full_markdown += f"\n\n--- Page {page_num + 1} ---\n\n*[Error processing this page: {str(e)}]*"
             
             return {
-                "markdown": full_markdown,
-                "page_count": len(doc),
-                "detected_tables": [],
+                "markdown": full_markdown.strip(),
+                "page_count": page_count,
+                "detected_tables": [],  # Could be enhanced with table detection
                 "status": "success",
+                "provider": "tesseract",
                 "attempt": 1 
             }
                 
@@ -158,5 +154,13 @@ class DeepSeekOCRService:
                 "markdown": "",
                 "error": str(e),
                 "status": "failed",
+                "provider": "tesseract",
                 "attempt": 1
             }
+        finally:
+            # Always close the document if it was opened
+            if doc is not None:
+                try:
+                    doc.close()
+                except:
+                    pass  # Ignore errors when closing

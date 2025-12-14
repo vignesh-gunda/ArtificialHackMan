@@ -8,6 +8,7 @@ class Severity(str, Enum):
     HIGH = "High"
     MEDIUM = "Medium"
     LOW = "Low"
+    WARNING = "Warning"
     INFO = "Info"
 
 class AuditFinding(BaseModel):

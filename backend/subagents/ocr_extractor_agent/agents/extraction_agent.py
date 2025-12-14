@@ -4,6 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, List
+from pathlib import Path
 from config.models import ExtractionResult, AuditFinding
 from utils.validation import validate_finding
 import os
@@ -26,9 +27,10 @@ DOCUMENT CONTENT:
 EXTRACTION REQUIREMENTS:
 1. Find ALL findings - if you miss any, the security audit fails
 2. Confidence scores must reflect your certainty (0.0-1.0)
-3. IncludeUnexpected fields in 'additional_fields'
+3. Include unexpected fields in 'additional_fields'
 4. Table data takes priority - findings are often in tables
 5. Repository URLs and commit IDs are CRITICAL - extract precisely
+6. Severity MUST be one of: "Critical", "High", "Medium", "Low", "Warning", "Info"
 
 OUTPUT FORMAT:
 {format_instructions}

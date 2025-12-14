@@ -1,6 +1,7 @@
-from config.models import AuditFinding
+from config.models import AuditFinding, Severity
 from typing import List
 import re
+import os
 
 def validate_finding(finding: AuditFinding) -> List[str]:
     """Validate single finding with domain rules"""

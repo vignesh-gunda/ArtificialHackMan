@@ -291,7 +291,16 @@ with tab4:
         
         with col2:
             st.subheader("Confidence Distribution")
-            st.hist_chart(df, x="Confidence", bins=10)
+            # Create histogram data manually
+            confidence_data = df["Confidence"].dropna()
+            if len(confidence_data) > 0:
+                import numpy as np
+                hist_data, bin_edges = np.histogram(confidence_data, bins=10)
+                bin_labels = [f"{bin_edges[i]:.2f}-{bin_edges[i+1]:.2f}" for i in range(len(hist_data))]
+                hist_df = pd.DataFrame({"Range": bin_labels, "Count": hist_data})
+                st.bar_chart(hist_df.set_index("Range"))
+            else:
+                st.info("No confidence data available")
         
         # Detailed table
         st.subheader("Detailed Results")
@@ -311,7 +320,13 @@ with tab4:
             )
         
         with col2:
-            json_data = json.dumps(st.session_state.extraction_results, indent=2)
+            # Convert extraction results to JSON-serializable format
+            def serialize_datetime(obj):
+                if hasattr(obj, 'isoformat'):
+                    return obj.isoformat()
+                raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+            
+            json_data = json.dumps(st.session_state.extraction_results, indent=2, default=serialize_datetime)
             st.download_button(
                 "📥 Download JSON",
                 json_data,
