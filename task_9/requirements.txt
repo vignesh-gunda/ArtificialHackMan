@@ -1,0 +1,26 @@
+# Core dependencies for World Happiness Dashboard System
+openpyxl>=3.1.0
+transformers>=4.30.0
+torch>=2.0.0
+pandas>=2.0.0
+openai>=1.0.0
+
+# Additional dependencies for data processing and visualization
+numpy>=1.24.0
+xlrd>=2.0.0
+requests>=2.30.0
+python-dotenv>=1.0.0
+
+# LangChain dependencies for agent functionality
+langchain>=0.1.0
+langchain-openai>=0.1.0
+langchain-community>=0.1.0
+langchain-core>=0.1.0
+langgraph>=0.0.40
+
+# PandasAI and visualization dependencies
+pandasai>=2.0.0
+pandasai-litellm>=0.1.0
+plotly>=5.17.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
