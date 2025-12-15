@@ -2,10 +2,13 @@
 """
 Wan 2.5 Video Generator using Speech-to-Text + Replicate
 Converts audio to text, then generates video using Wan 2.5 model
+Enhanced with retry logic, better prompts, and improved error handling
 """
 
 import os
 import sys
+import time
+import random
 from typing import Dict, List, TypedDict, Optional
 from pathlib import Path
 import speech_recognition as sr
@@ -13,11 +16,29 @@ import replicate
 import moviepy as mp
 from datetime import datetime
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langgraph.graph import StateGraph, END
 
 # Load environment variables from .env file
-load_dotenv()
+# Try multiple locations for the .env file
+_base_dir = Path(__file__).parent.parent
+load_dotenv(_base_dir / ".env")  # Load from video_generator_agent directory
+load_dotenv()  # Also try current directory
+
+# Wan 2.5 API Configuration
+WAN_CONFIG = {
+    "model": "wan-video/wan-2.5-t2v",  # Primary model
+    "fallback_models": [
+        "minimax/video-01",  # Fallback option 1
+        "luma/ray",  # Fallback option 2
+    ],
+    "max_retries": 3,
+    "base_delay": 2,  # Base delay for exponential backoff (seconds)
+    "max_delay": 30,  # Maximum delay between retries
+    "timeout": 300,  # 5 minute timeout per segment
+    "valid_durations": [5, 10],  # Wan 2.5 only supports 5 or 10 second clips
+}
 
 class WanVideoState(TypedDict):
     """State for Wan video generation workflow"""
@@ -31,13 +52,193 @@ class WanVideoState(TypedDict):
     status: str
     error: str
 
+
+class WanAPIClient:
+    """Enhanced Wan 2.5 API client with retry logic and fallback support"""
+    
+    def __init__(self):
+        self.config = WAN_CONFIG
+        self.current_model = self.config["model"]
+        self.api_available = bool(os.getenv("REPLICATE_API_TOKEN"))
+        
+    def generate_video_with_retry(self, prompt: str, duration: int = 5, 
+                                   negative_prompt: str = None) -> Optional[bytes]:
+        """
+        Generate video using Wan 2.5 with retry logic and exponential backoff
+        
+        Args:
+            prompt: The text prompt for video generation
+            duration: Video duration (5 or 10 seconds)
+            negative_prompt: Things to avoid in the video
+            
+        Returns:
+            Video bytes if successful, None otherwise
+        """
+        if not self.api_available:
+            print("⚠️ REPLICATE_API_TOKEN not set - skipping API call")
+            return None
+            
+        # Validate duration
+        if duration not in self.config["valid_durations"]:
+            duration = 5 if duration < 7.5 else 10
+            
+        # Build optimized input for 2D animation
+        input_data = self._build_optimized_input(prompt, duration, negative_prompt)
+        
+        # Try primary model with retries
+        result = self._try_model_with_retries(self.current_model, input_data)
+        if result:
+            return result
+            
+        # Try fallback models
+        for fallback_model in self.config["fallback_models"]:
+            print(f"🔄 Trying fallback model: {fallback_model}")
+            result = self._try_model_with_retries(fallback_model, input_data)
+            if result:
+                self.current_model = fallback_model  # Remember working model
+                return result
+                
+        return None
+    
+    def _build_optimized_input(self, prompt: str, duration: int, 
+                                negative_prompt: str = None) -> Dict:
+        """Build optimized input parameters for 2D animation generation"""
+        
+        # Enhance prompt for better 2D animation results
+        enhanced_prompt = self._enhance_prompt_for_2d(prompt)
+        
+        # Default negative prompt for 2D animation
+        default_negative = (
+            "photorealistic, 3D render, CGI, realistic textures, "
+            "live action, real people, photographs, blurry, low quality, "
+            "distorted, deformed, ugly, bad anatomy, watermark, text overlay"
+        )
+        
+        input_data = {
+            "prompt": enhanced_prompt,
+            "duration": duration,
+        }
+        
+        # Add negative prompt if supported
+        if negative_prompt:
+            input_data["negative_prompt"] = f"{default_negative}, {negative_prompt}"
+        else:
+            input_data["negative_prompt"] = default_negative
+            
+        return input_data
+    
+    def _enhance_prompt_for_2d(self, prompt: str) -> str:
+        """Enhance prompt specifically for 2D animation style"""
+        
+        # Key 2D animation style keywords
+        style_prefix = (
+            "2D animated explainer video, flat design style, "
+            "clean vector graphics, motion graphics, "
+            "professional corporate animation, "
+        )
+        
+        style_suffix = (
+            " Smooth animations, modern flat design aesthetic, "
+            "vibrant colors, clean lines, minimalist style, "
+            "professional business animation quality."
+        )
+        
+        # Don't double-add if already present
+        if "2D animated" not in prompt:
+            prompt = style_prefix + prompt
+        if "flat design" not in prompt.lower():
+            prompt = prompt + style_suffix
+            
+        # Limit prompt length (some models have limits)
+        words = prompt.split()
+        if len(words) > 150:
+            prompt = " ".join(words[:150])
+            
+        return prompt
+    
+    def _try_model_with_retries(self, model: str, input_data: Dict) -> Optional[bytes]:
+        """Try a specific model with exponential backoff retries"""
+        
+        for attempt in range(self.config["max_retries"]):
+            try:
+                print(f"🎬 Attempt {attempt + 1}/{self.config['max_retries']} with {model}...")
+                
+                output = replicate.run(model, input=input_data)
+                
+                # Handle different output types
+                if hasattr(output, 'read'):
+                    return output.read()
+                elif isinstance(output, str):
+                    # URL returned - download it
+                    import urllib.request
+                    with urllib.request.urlopen(output) as response:
+                        return response.read()
+                elif isinstance(output, list) and len(output) > 0:
+                    # List of URLs
+                    import urllib.request
+                    with urllib.request.urlopen(output[0]) as response:
+                        return response.read()
+                else:
+                    print(f"⚠️ Unexpected output type: {type(output)}")
+                    return None
+                    
+            except Exception as e:
+                error_msg = str(e)
+                print(f"❌ Attempt {attempt + 1} failed: {error_msg}")
+                
+                # Check if it's a retryable error
+                if self._is_retryable_error(error_msg):
+                    if attempt < self.config["max_retries"] - 1:
+                        delay = self._calculate_backoff_delay(attempt)
+                        print(f"⏳ Waiting {delay:.1f}s before retry...")
+                        time.sleep(delay)
+                else:
+                    # Non-retryable error, break immediately
+                    print(f"🚫 Non-retryable error, skipping remaining attempts")
+                    break
+                    
+        return None
+    
+    def _is_retryable_error(self, error_msg: str) -> bool:
+        """Determine if an error is retryable"""
+        
+        retryable_patterns = [
+            "temporarily unavailable",
+            "rate limit",
+            "timeout",
+            "503",
+            "502",
+            "504",
+            "connection",
+            "E004",  # Replicate service unavailable
+        ]
+        
+        error_lower = error_msg.lower()
+        return any(pattern.lower() in error_lower for pattern in retryable_patterns)
+    
+    def _calculate_backoff_delay(self, attempt: int) -> float:
+        """Calculate exponential backoff delay with jitter"""
+        
+        base_delay = self.config["base_delay"]
+        max_delay = self.config["max_delay"]
+        
+        # Exponential backoff: 2^attempt * base_delay
+        delay = min(base_delay * (2 ** attempt), max_delay)
+        
+        # Add random jitter (±25%)
+        jitter = delay * 0.25 * (random.random() * 2 - 1)
+        
+        return delay + jitter
+
 class WanVideoGenerator:
     def __init__(self):
         """Initialize Wan Video Generator"""
-        self.audio_path = "project/inputs/VoiceOver.wav"
+        # Use path relative to this file's location
+        self.base_dir = Path(__file__).parent.parent
+        self.audio_path = str(self.base_dir / "project" / "inputs" / "VoiceOver.wav")
         
         # Create wan-specific output directory
-        self.base_output_dir = Path("human_deliverable")
+        self.base_output_dir = self.base_dir / "human_deliverable"
         self.base_output_dir.mkdir(exist_ok=True)
         
         self.model_output_dir = self.base_output_dir / "wan-2.5"
@@ -46,11 +247,21 @@ class WanVideoGenerator:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_path = self.model_output_dir / f"TreeService_wan_{timestamp}.mp4"
         
-        self.temp_dir = Path("temp_wan_videos")
+        self.temp_dir = self.base_dir / "temp_wan_videos"
         self.temp_dir.mkdir(exist_ok=True)
         
         # Initialize speech recognition
         self.recognizer = sr.Recognizer()
+        
+        # Initialize Wan API client with retry logic
+        self.wan_client = WanAPIClient()
+        
+        # Track generation statistics
+        self.stats = {
+            "api_successes": 0,
+            "api_failures": 0,
+            "fallback_used": 0,
+        }
         
         # Build the workflow
         self.workflow = self.build_workflow()
@@ -267,35 +478,17 @@ class WanVideoGenerator:
     def create_detailed_prompt_structure(self, base_prompt: str, segment_details: str) -> str:
         """Create a well-structured, detailed 2D animated video prompt for optimal generation"""
         
+        # More concise prompt structure optimized for Wan 2.5
+        # Wan 2.5 works better with shorter, more focused prompts
         structured_prompt = f"""
-        COMPANY: Skyline Tree Services - Professional Tree Care Company
+        2D animated explainer video, flat design style, motion graphics.
         
-        2D ANIMATED VIDEO CONTENT: {base_prompt}
+        Scene: {segment_details[:200]}
         
-        2D ANIMATION SEGMENT DETAILS: {segment_details}
-        
-        2D ANIMATION TECHNICAL REQUIREMENTS:
-        - High-quality 2D animated video production
-        - Flat design aesthetic and clean vector graphics
-        - Smooth motion graphics and transitions
-        - 1080p resolution quality for 2D animation
-        - Professional 2D animation color grading
-        - No photorealistic elements, pure 2D flat design
-        
-        2D BRANDING REQUIREMENTS:
-        - Animated Skyline Tree Services logo with smooth transitions
-        - Company name displayed with clean typography
-        - Professional branding elements in flat design style
-        - Branded color scheme (greens, browns, light blues) in vector format
-        - Corporate identity through 2D animated elements
-        
-        2D ANIMATION QUALITY STANDARDS:
-        - Professional 2D animated business presentation
-        - Trustworthy and reliable flat design appearance
-        - Clean, modern 2D aesthetic with smooth animations
-        - Customer confidence building through quality motion graphics
-        - Expert service demonstration via 2D animated sequences
-        - Icon-based animations with subtle character illustrations
+        Style: Clean vector graphics, smooth animations, professional corporate look.
+        Colors: Natural greens, browns, light blues, white backgrounds.
+        Animation: Subtle movements, icon animations, text overlays, transitions.
+        Quality: High-quality 2D animation, modern flat design aesthetic.
         """
         
         return " ".join(structured_prompt.split())  # Clean up whitespace
@@ -303,38 +496,31 @@ class WanVideoGenerator:
     def validate_and_optimize_prompt(self, prompt: str) -> str:
         """Validate and optimize the prompt for best 2D animated video generation results"""
         
-        # Ensure key 2D animation elements are present
-        required_elements = [
-            "2D animated",
-            "flat design",
-            "Skyline Tree Services",
-            "professional",
-            "tree service"
-        ]
-        
         optimized_prompt = prompt
         
-        # Add missing critical 2D animation elements
-        for element in required_elements:
-            if element.lower() not in prompt.lower():
-                optimized_prompt = f"{element} {optimized_prompt}"
+        # Remove any problematic terms that might confuse the model
+        problematic_terms = ["photorealistic", "3D render", "CGI", "realistic", "photograph"]
+        for term in problematic_terms:
+            optimized_prompt = optimized_prompt.replace(term, "2D animated")
         
-        # Ensure 2D animation style is emphasized
-        if "photorealistic" in optimized_prompt.lower():
-            optimized_prompt = optimized_prompt.replace("photorealistic", "2D animated")
-        if "3D" in optimized_prompt:
-            optimized_prompt = optimized_prompt.replace("3D", "2D")
+        # Ensure 2D animation style is at the start (most important for model attention)
+        if not optimized_prompt.lower().startswith("2d"):
+            optimized_prompt = f"2D animated flat design video: {optimized_prompt}"
         
-        # Add 2D animation emphasis if not present
-        if "2D" not in optimized_prompt:
-            optimized_prompt = f"2D animated {optimized_prompt}"
-        
-        # Ensure prompt length is optimal (not too long, not too short)
+        # Optimal prompt length for Wan 2.5 is around 50-100 words
+        # Too long prompts can confuse the model
         words = optimized_prompt.split()
-        if len(words) > 200:  # Trim if too long
-            optimized_prompt = " ".join(words[:200]) + "..."
-        elif len(words) < 20:  # Expand if too short
-            optimized_prompt += " 2D animated professional tree care service demonstration with flat design graphics and motion graphics"
+        if len(words) > 100:
+            # Keep the most important parts (beginning and style descriptors)
+            optimized_prompt = " ".join(words[:100])
+        elif len(words) < 20:
+            # Expand if too short
+            optimized_prompt += " smooth motion graphics, professional animation, clean design"
+        
+        # Add quality boosters at the end
+        quality_suffix = ", high quality, smooth animation, professional"
+        if "high quality" not in optimized_prompt.lower():
+            optimized_prompt += quality_suffix
         
         return optimized_prompt
     
@@ -343,10 +529,11 @@ class WanVideoGenerator:
         
         try:
             print("🎬 Generating video with Wan 2.5 model...")
+            print(f"🔧 API Available: {self.wan_client.api_available}")
+            print(f"🎯 Using model: {self.wan_client.current_model}")
             
             # Check for Replicate API token - if not available, use direct content generation
-            use_wan_api = bool(os.getenv("REPLICATE_API_TOKEN"))
-            if not use_wan_api:
+            if not self.wan_client.api_available:
                 print("⚠️ REPLICATE_API_TOKEN not found - using direct content generation")
                 return self.generate_direct_content_segments(state)
             
@@ -359,6 +546,7 @@ class WanVideoGenerator:
             
             print(f"📹 Generating {len(audio_segments)} content-aware video segments")
             print(f"🎤 Total audio duration: {duration:.2f} seconds")
+            print(f"🔄 Max retries per segment: {WAN_CONFIG['max_retries']}")
             
             video_segments = []
             
@@ -369,7 +557,8 @@ class WanVideoGenerator:
                 content_type = segment_info["content_type"]
                 content_text = segment_info["text"]
                 
-                print(f"\n🎬 Generating segment {i+1}/{len(audio_segments)}...")
+                print(f"\n{'='*60}")
+                print(f"🎬 Generating segment {i+1}/{len(audio_segments)}...")
                 print(f"⏱️  Time: {start_time:.1f}s - {end_time:.1f}s ({segment_duration:.1f}s)")
                 print(f"📝 Content: {content_type}")
                 print(f"🎤 Audio text: {content_text[:50]}...")
@@ -384,36 +573,48 @@ class WanVideoGenerator:
                 final_prompt = self.validate_and_optimize_prompt(structured_prompt)
                 
                 print(f"📝 Final prompt length: {len(final_prompt.split())} words")
-                print(f"🎯 Prompt preview: {final_prompt[:150]}...")
+                print(f"🎯 Prompt preview: {final_prompt[:120]}...")
                 
-                # Generate video segment using Wan 2.5 with valid duration (5 or 10 seconds only)
+                # Determine Wan duration (5 or 10 seconds only)
                 wan_duration = 10 if segment_duration > 7.5 else 5
-                input_data = {
-                    "prompt": final_prompt,
-                    "duration": wan_duration
-                }
                 
-                try:
-                    output = replicate.run(
-                        "wan-video/wan-2.5-t2v",
-                        input=input_data
-                    )
-                    
+                # Create content-specific negative prompt
+                negative_prompt = self._get_negative_prompt_for_content(content_type)
+                
+                # Use the enhanced API client with retry logic
+                video_bytes = self.wan_client.generate_video_with_retry(
+                    prompt=final_prompt,
+                    duration=wan_duration,
+                    negative_prompt=negative_prompt
+                )
+                
+                if video_bytes:
                     # Save video segment with timing info
                     segment_path = self.temp_dir / f"segment_{i+1:02d}_{start_time:.1f}s-{end_time:.1f}s.mp4"
                     
                     with open(segment_path, "wb") as file:
-                        file.write(output.read())
+                        file.write(video_bytes)
                     
                     video_segments.append(str(segment_path))
-                    print(f"✅ Segment {i+1} generated: {segment_path}")
+                    self.stats["api_successes"] += 1
+                    print(f"✅ Segment {i+1} generated successfully via API!")
+                else:
+                    print(f"⚠️ API generation failed for segment {i+1}, using fallback...")
+                    self.stats["api_failures"] += 1
                     
-                except Exception as e:
-                    print(f"❌ Failed to generate segment {i+1}: {e}")
                     # Create a fallback segment with exact timing and actual content
                     fallback_path = self.create_fallback_segment(i+1, segment_duration, content_type, content_text)
                     if fallback_path:
                         video_segments.append(fallback_path)
+                        self.stats["fallback_used"] += 1
+                        print(f"✅ Fallback segment {i+1} created")
+            
+            # Print generation statistics
+            print(f"\n{'='*60}")
+            print(f"📊 Generation Statistics:")
+            print(f"   ✅ API Successes: {self.stats['api_successes']}")
+            print(f"   ❌ API Failures: {self.stats['api_failures']}")
+            print(f"   🔄 Fallbacks Used: {self.stats['fallback_used']}")
             
             state["video_segments"] = video_segments
             state["status"] = f"Generated {len(video_segments)} content-synchronized video segments"
@@ -421,8 +622,30 @@ class WanVideoGenerator:
         except Exception as e:
             state["error"] = f"Video generation failed: {str(e)}"
             print(f"❌ Video generation error: {e}")
+            import traceback
+            traceback.print_exc()
             
         return state
+    
+    def _get_negative_prompt_for_content(self, content_type: str) -> str:
+        """Get content-specific negative prompts to avoid unwanted elements"""
+        
+        base_negative = "blurry, low quality, distorted, ugly, watermark"
+        
+        content_negatives = {
+            "introduction": f"{base_negative}, cluttered, busy background",
+            "consultation": f"{base_negative}, empty room, no people",
+            "assessment": f"{base_negative}, dead trees, destruction",
+            "pruning": f"{base_negative}, dangerous, accidents",
+            "stump_removal": f"{base_negative}, messy, incomplete",
+            "planning": f"{base_negative}, disorganized, chaotic",
+            "technology": f"{base_negative}, outdated, broken equipment",
+            "safety": f"{base_negative}, unsafe, accidents, injuries",
+            "cleanup": f"{base_negative}, dirty, messy, incomplete",
+            "call_to_action": f"{base_negative}, unclear, hard to read",
+        }
+        
+        return content_negatives.get(content_type, base_negative)
     
     def analyze_audio_content_segments(self, transcribed_text: str, total_duration: float) -> List[Dict]:
         """Analyze transcribed text to create content-aware segments that match audio timing"""
@@ -833,27 +1056,22 @@ class WanVideoGenerator:
             
             fig, ax = plt.subplots(figsize=(19.2, 10.8), dpi=100)
             
-            # Use actual transcribed text if available
-            if content_text and len(content_text) > 10:
-                # Clean and format the transcribed text
-                display_text = content_text[:100] + "..." if len(content_text) > 100 else content_text
-                display_text = display_text.replace(". ", ".\n")  # Add line breaks
-            else:
-                # Fallback to content type
-                content_info = {
-                    "introduction": "Welcome to\nSkyline Tree Services\nYour Trusted Partner",
-                    "consultation": "Professional Consultation\nUnderstanding Your Needs",
-                    "assessment": "Tree Health Assessment\nExpert Evaluation",
-                    "pruning": "Expert Pruning\nProfessional Tree Care",
-                    "stump_removal": "Stump Removal\nComplete Solutions",
-                    "planning": "Customized Planning\nTailored Solutions",
-                    "technology": "Modern Technology\nAdvanced Techniques", 
-                    "safety": "Safety First\nProtecting Everyone",
-                    "cleanup": "Professional Cleanup\nBeautiful Results",
-                    "call_to_action": "Contact Us Today\nSkyline Tree Services",
-                    "general": "Skyline Tree Services\nProfessional Tree Care"
-                }
-                display_text = content_info.get(content_type, content_info["general"])
+            # Use clean, professional titles based on content type
+            # Don't display raw transcribed text or prompts - use polished titles
+            content_info = {
+                "introduction": "Welcome to\nSkyline Tree Services\nYour Trusted Partner",
+                "consultation": "Professional Consultation\nUnderstanding Your Needs",
+                "assessment": "Tree Health Assessment\nExpert Evaluation",
+                "pruning": "Expert Pruning\nProfessional Tree Care",
+                "stump_removal": "Stump Removal\nComplete Solutions",
+                "planning": "Customized Planning\nTailored Solutions",
+                "technology": "Modern Technology\nAdvanced Techniques", 
+                "safety": "Safety First\nProtecting Everyone",
+                "cleanup": "Professional Cleanup\nBeautiful Results",
+                "call_to_action": "Contact Us Today\nSkyline Tree Services",
+                "general": "Skyline Tree Services\nProfessional Tree Care"
+            }
+            display_text = content_info.get(content_type, content_info["general"])
             
             # Style based on content type
             colors = {
